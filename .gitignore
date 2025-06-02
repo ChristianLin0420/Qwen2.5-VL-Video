@@ -11,3 +11,6 @@ wheels/
 
 # dataset
 # datasets/
+
+# wandb
+qwen-vl-finetune/wandb/

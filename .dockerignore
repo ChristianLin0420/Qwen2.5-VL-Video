@@ -1,0 +1,62 @@
+# Git files
+.git
+.gitignore
+
+# Python cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Model checkpoints and outputs (usually large)
+checkpoints/
+output/
+*.pth
+*.pt
+*.bin
+*.safetensors
+
+# Logs and temporary files
+*.log
+logs/
+tmp/
+temp/
+
+# Documentation
+docs/
+*.md
+!README.md
+!docker-instructions.md
+
+# Test files
+tests/
+test_*.py
+
+# Other Docker files
+Dockerfile*
+docker-compose*.yml
+.dockerignore 
