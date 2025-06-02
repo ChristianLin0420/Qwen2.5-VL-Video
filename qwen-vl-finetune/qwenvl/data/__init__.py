@@ -26,12 +26,18 @@ VIDEOCHATGPT = {
     "data_path": "PATH_TO_VIDEOCHATGPT_DATA",
 }
 
+ASSY07_GRPO = {
+    "annotation_path": "../datasets/ASSY07-relabel-train-10vids-train-mcq-min_frames_4-max_frames_8_grpo.json",
+    "data_path": "../datasets/",
+}
+
 data_dict = {
     "cambrian_737k": CAMBRIAN_737K,
     "cambrian_737k_pack": CAMBRIAN_737K_PACK,
     "mp_doc": MP_DOC,
     "clevr_mc": CLEVR_MC,
     "videochatgpt": VIDEOCHATGPT,
+    "assy07_grpo": ASSY07_GRPO,
 }
 
 

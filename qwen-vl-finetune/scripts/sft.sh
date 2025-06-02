@@ -3,6 +3,8 @@
 # Distributed training configuration
 MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 MASTER_PORT=${MASTER_PORT:-$(shuf -i 20001-29999 -n 1)}
+WORLD_SIZE=1
+NPROC_PER_NODE=1
 NNODES=${WORLD_SIZE:-1}
 
 # DeepSpeed configuration
@@ -20,7 +22,7 @@ grad_accum_steps=4
 entry_file=qwenvl/train/train_qwen.py
 
 # Dataset configuration (replace with public dataset names)
-datasets=public_dataset1,public_dataset2
+datasets=assy07_grpo
 
 # Output configuration
 run_name="qwen2vl-baseline"
@@ -61,6 +63,7 @@ args="
 
 # Launch training
 torchrun --nproc_per_node=${NPROC_PER_NODE} \
+         --nnodes=${NNODES} \
          --master_addr=${MASTER_ADDR} \
          --master_port=${MASTER_PORT} \
          ${entry_file} ${args}

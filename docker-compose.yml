@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  qwen-vl:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: qwen25-vl-video:latest
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - MASTER_ADDR=127.0.0.1
+      - MASTER_PORT=29500
+      - WANDB_API_KEY=${WANDB_API_KEY}  # Set your W&B API key as environment variable
+    volumes:
+      - .:/workspace
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface  # Cache HuggingFace models
+      - ${HOME}/.cache/torch:/root/.cache/torch  # Cache PyTorch models
+    stdin_open: true
+    tty: true
+    command: bash -c "conda activate qwen && bash"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # Service for running training
+  qwen-vl-train:
+    extends: qwen-vl
+    command: bash -c "conda activate qwen && cd /workspace/qwen-vl-finetune && bash scripts/sft.sh"
+    
+  # Service for running web demo
+  qwen-vl-demo:
+    extends: qwen-vl
+    ports:
+      - "7860:7860"  # Gradio default port
+    command: bash -c "conda activate qwen && cd /workspace && python web_demo_mm.py" 
