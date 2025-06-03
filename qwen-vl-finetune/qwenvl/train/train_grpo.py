@@ -8,6 +8,7 @@ from typing import Dict
 import shutil
 import sys
 from pathlib import Path
+import wandb
 
 project_root = Path(__file__).parent.parent.parent
 sys.path.append(str(project_root))
@@ -86,6 +87,30 @@ def train_grpo(attn_implementation="flash_attention_2"):
     local_rank = training_args.local_rank
     os.makedirs(training_args.output_dir, exist_ok=True)
 
+    # Initialize wandb for GRPO training
+    if torch.distributed.get_rank() == 0:  # Only initialize on rank 0
+        wandb_run = wandb.init(
+            project="qwen-vl-grpo",
+            name=training_args.run_name if training_args.run_name else f"grpo_{os.path.basename(training_args.output_dir)}",
+            config={
+                "model_name": model_args.model_name_or_path,
+                "dataset": data_args.dataset_use,
+                "learning_rate": training_args.learning_rate,
+                "batch_size": training_args.per_device_train_batch_size,
+                "grpo_alpha": training_args.grpo_alpha,
+                "grpo_beta": training_args.grpo_beta,
+                "format_reward_weight": training_args.format_reward_weight,
+                "accuracy_reward_weight": training_args.accuracy_reward_weight,
+                "grpo_sample_size": training_args.grpo_sample_size,
+                "generation_max_length": training_args.generation_max_length,
+                "generation_temperature": training_args.generation_temperature,
+            },
+            tags=["grpo", "qwen-vl", "multimodal"],
+        )
+        print(f"Initialized wandb run: {wandb_run.name}")
+    else:
+        wandb_run = None
+
     # Load model
     if "qwen2.5" in model_args.model_name_or_path.lower():
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
@@ -148,11 +173,12 @@ def train_grpo(attn_implementation="flash_attention_2"):
     else:
         data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
     
-    # Create GRPO trainer
+    # Create GRPO trainer with wandb instance
     trainer = GRPOTrainer(
         model=model, 
         processing_class=tokenizer, 
-        args=training_args, 
+        args=training_args,
+        wandb_run=wandb_run,  # Pass wandb instance
         **data_module
     )
 
@@ -169,6 +195,11 @@ def train_grpo(attn_implementation="flash_attention_2"):
     model.config.use_cache = True
 
     safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
+    
+    # Finish wandb run
+    if wandb_run is not None:
+        wandb_run.finish()
+        print("Wandb run finished.")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
- #!/bin/bash
+#!/bin/bash
 
 # GRPO training script for Qwen-VL with video understanding
 
@@ -11,9 +11,14 @@ MODEL_PATH="Qwen/Qwen2.5-VL-3B-Instruct"  # Change to your model path
 OUTPUT_DIR="./output/qwen2.5-vl-3b-grpo-no-think"
 CACHE_DIR="./cache"
 
+# Dataset selection affects format rewards:
+# - Names with "no_think": Only <answer>...</answer> expected
+# - Names without "no_think": <think>...</think> <answer>...</answer> expected
+DATASET_NAME="assy07_grpo_no_think"
+
 # Training parameters
 NUM_TRAIN_EPOCHS=8
-BATCH_SIZE=2  # Adjust based on GPU memory
+BATCH_SIZE=1
 GRADIENT_ACCUMULATION_STEPS=8
 LEARNING_RATE=2e-5
 WARMUP_RATIO=0.03
@@ -28,6 +33,8 @@ GENERATION_MAX_LENGTH=32
 GENERATION_TEMPERATURE=0.7
 GENERATION_TOP_P=0.9
 GRPO_SAMPLE_SIZE=4
+GRPO_LOGGING_STEPS=1
+WANDB_RUN_NAME="qwen2.5-vl-3b-grpo-no-think"
 
 # Video parameters
 VIDEO_MAX_FRAMES=4
@@ -38,7 +45,7 @@ BASE_INTERVAL=2
 torchrun --nproc_per_node=8 --master_port=29500 \
     qwenvl/train/train_grpo.py \
     --model_name_or_path $MODEL_PATH \
-    --dataset_use "assy07_grpo_no_think" \
+    --dataset_use $DATASET_NAME \
     --data_flatten True \
     --output_dir $OUTPUT_DIR \
     --cache_dir $CACHE_DIR \
@@ -64,7 +71,7 @@ torchrun --nproc_per_node=8 --master_port=29500 \
     --gradient_checkpointing False \
     --dataloader_num_workers 4 \
     --report_to wandb \
-    --run_name "qwen2.5-vl-grpo" \
+    --run_name $WANDB_RUN_NAME \
     --bf16 True \
     --tune_mm_llm True \
     --tune_mm_vision False \
@@ -80,4 +87,5 @@ torchrun --nproc_per_node=8 --master_port=29500 \
     --generation_max_length $GENERATION_MAX_LENGTH \
     --generation_temperature $GENERATION_TEMPERATURE \
     --generation_top_p $GENERATION_TOP_P \
-    --grpo_sample_size $GRPO_SAMPLE_SIZE
+    --grpo_sample_size $GRPO_SAMPLE_SIZE \
+    --grpo_logging_steps $GRPO_LOGGING_STEPS

@@ -15,6 +15,8 @@ from torch.utils.data import DataLoader
 import transformers
 from collections import defaultdict
 import copy
+import wandb  # Add direct wandb import
+from datetime import datetime
 
 from qwenvl.train.trainer import replace_qwen2_vl_attention_class
 from qwenvl.train.grpo_flash_attn_override import replace_qwen2_vl_attention_class_grpo
@@ -26,13 +28,14 @@ class GRPOTrainingArguments(TrainingArguments):
     # GRPO specific arguments
     grpo_alpha: float = field(default=0.5, metadata={"help": "GRPO alpha parameter for reward weighting"})
     grpo_beta: float = field(default=0.1, metadata={"help": "GRPO beta parameter for KL penalty"})
-    format_reward_weight: float = field(default=0.3, metadata={"help": "Weight for format reward"})
-    accuracy_reward_weight: float = field(default=0.7, metadata={"help": "Weight for accuracy reward"})
+    format_reward_weight: float = field(default=1.0, metadata={"help": "Weight for format reward"})
+    accuracy_reward_weight: float = field(default=1.0, metadata={"help": "Weight for accuracy reward"})
     generation_max_length: int = field(default=512, metadata={"help": "Maximum length for generation"})
     generation_temperature: float = field(default=0.7, metadata={"help": "Temperature for generation"})
     generation_top_p: float = field(default=0.9, metadata={"help": "Top-p for generation"})
     generation_num_beams: int = field(default=1, metadata={"help": "Number of beams for generation"})
     grpo_sample_size: int = field(default=4, metadata={"help": "Number of samples to generate per example"})
+    grpo_logging_steps: int = field(default=50, metadata={"help": "Log GRPO metrics every N steps"})
     
     # Extend parent class arguments
     cache_dir: Optional[str] = field(default=None)
@@ -58,6 +61,7 @@ class GRPOTrainer(Trainer):
         callbacks=None,
         optimizers=(None, None),
         preprocess_logits_for_metrics=None,
+        wandb_run=None,  # Add wandb_run parameter
     ):
         super().__init__(
             model=model,
@@ -73,48 +77,214 @@ class GRPOTrainer(Trainer):
             preprocess_logits_for_metrics=preprocess_logits_for_metrics,
         )
         
+        # Store wandb run instance
+        self.wandb_run = wandb_run
+        
         # Initialize reference model for KL computation
         self.ref_model = copy.deepcopy(self.model)
         self.ref_model.eval()
         for param in self.ref_model.parameters():
             param.requires_grad = False
         
+        # Initialize metric tracking for GRPO logging
+        self.grpo_metrics = {
+            'policy_seq_log_prob': [],
+            'kl_div': [],
+            'format_reward': [],
+            'accuracy_reward': [],
+            'total_reward': [],
+            'advantage': []
+        }
+        self._global_step_count = 0
+        
+        # Determine if dataset requires thinking process based on dataset name
+        dataset_name = getattr(args, 'dataset_use', '')
+        self.requires_thinking = 'no_think' not in dataset_name.lower()
+        
+        # Initialize JSON output logging
+        self.output_log_file = os.path.join(args.output_dir, f"grpo_outputs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+        self.outputs_buffer = []
+        self.max_buffer_size = 50  # Save to file every 50 samples
+        
         # DON'T replace attention here - only during training
+        
+    def log_grpo_metrics(self, step: Optional[int] = None):
+        """Log accumulated GRPO metrics directly to wandb."""
+        if not self.grpo_metrics['policy_seq_log_prob']:  # No metrics collected yet
+            return
+            
+        # Calculate averages
+        avg_metrics = {}
+        for key, values in self.grpo_metrics.items():
+            if values:
+                avg_metrics[f"grpo/{key}"] = sum(values) / len(values)
+        
+        # Add step information
+        if step is None:
+            step = self.state.global_step
+            
+        # Log directly to wandb using passed wandb_run instance
+        try:
+            if self.wandb_run is not None and torch.distributed.get_rank() == 0:
+                self.wandb_run.log(avg_metrics, step=step)
+        except Exception as e:
+            print(f"Error logging to wandb: {e}")
+            print(f"Metrics that would be logged: {avg_metrics}")
+        
+        # Clear metrics after logging
+        for key in self.grpo_metrics:
+            self.grpo_metrics[key].clear()
+            
+        # Print metrics for monitoring
+        metric_str = ", ".join([f"{k.split('/')[-1]}: {v:.4f}" for k, v in avg_metrics.items()])
+        print(f"Step {step} - GRPO Metrics: {metric_str}")
+    
+    def save_output_sample(self, prompt: str, generated_text: str, ground_truth: str, 
+                          format_reward: float, accuracy_reward: float, step: int):
+        """Save a sample of generated output to buffer and file."""
+        sample = {
+            "step": step,
+            "timestamp": datetime.now().isoformat(),
+            "prompt": prompt,
+            "generated_text": generated_text,
+            "ground_truth": ground_truth,
+            "format_reward": format_reward,
+            "accuracy_reward": accuracy_reward,
+            "total_reward": (self.args.format_reward_weight * format_reward + 
+                           self.args.accuracy_reward_weight * accuracy_reward)
+        }
+        
+        self.outputs_buffer.append(sample)
+        
+        # Save to file when buffer is full
+        if len(self.outputs_buffer) >= self.max_buffer_size:
+            self._flush_outputs_to_file()
+    
+    def _flush_outputs_to_file(self):
+        """Flush buffered outputs to JSON file."""
+        if not self.outputs_buffer:
+            return
+            
+        # Read existing data if file exists
+        existing_data = []
+        if os.path.exists(self.output_log_file):
+            try:
+                with open(self.output_log_file, 'r', encoding='utf-8') as f:
+                    existing_data = json.load(f)
+            except (json.JSONDecodeError, FileNotFoundError):
+                existing_data = []
+        
+        # Append new data
+        existing_data.extend(self.outputs_buffer)
+        
+        # Write back to file
+        os.makedirs(os.path.dirname(self.output_log_file), exist_ok=True)
+        with open(self.output_log_file, 'w', encoding='utf-8') as f:
+            json.dump(existing_data, f, indent=2, ensure_ascii=False)
+        
+        print(f"Saved {len(self.outputs_buffer)} output samples to {self.output_log_file}")
+        self.outputs_buffer.clear()
+    
+    def _extract_prompt_from_input(self, input_ids: torch.Tensor) -> str:
+        """Extract the prompt part (before assistant response) from input_ids."""
+        # Find assistant token position
+        assistant_token = "<|im_start|>assistant\n"
+        assistant_ids = self.processing_class.encode(assistant_token, add_special_tokens=False)
+        
+        seq = input_ids.cpu().tolist()
+        
+        # Find where assistant response starts
+        for i in range(len(seq) - len(assistant_ids)):
+            if seq[i:i+len(assistant_ids)] == assistant_ids:
+                # Extract everything before assistant response
+                prompt_ids = seq[:i + len(assistant_ids)]
+                return self.processing_class.decode(prompt_ids, skip_special_tokens=False)
+        
+        # If no assistant token found, return full sequence
+        return self.processing_class.decode(seq, skip_special_tokens=False)
+    
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        """Override training step to handle GRPO metric logging."""
+        # Increment step counter
+        self._global_step_count += 1
+        
+        # Call parent training step
+        loss = super().training_step(model, inputs, num_items_in_batch)
+        
+        # Log GRPO metrics if it's time
+        if self._global_step_count % self.args.grpo_logging_steps == 0:
+            self.log_grpo_metrics(step=self.state.global_step)
+        
+        return loss
         
     def compute_format_reward(self, generated_text: str) -> float:
         """
-        Compute format reward based on whether the output follows the required format.
-        Expected format: <think> ... </think> <answer>actions</answer>
+        Compute format reward based on dataset type and expected format.
+        - Thinking datasets: <think>...</think> <answer>...</answer>
+        - No-thinking datasets: <answer>...</answer> only
+        Returns 1.0 for correct format, 0.0 otherwise.
         """
-        # Check for think tags
-        think_pattern = r'<think>.*?</think>'
-        has_think = bool(re.search(think_pattern, generated_text, re.DOTALL))
+        # Clean the generated text - strip whitespace
+        text = generated_text.strip()
         
-        # Check for answer tags
-        answer_pattern = r'<answer>.*?</answer>'
-        has_answer = bool(re.search(answer_pattern, generated_text, re.DOTALL))
-        
-        # Check if answer appears after think
-        if has_think and has_answer:
-            think_match = re.search(think_pattern, generated_text, re.DOTALL)
-            answer_match = re.search(answer_pattern, generated_text, re.DOTALL)
-            if think_match and answer_match:
-                correct_order = think_match.end() <= answer_match.start()
-            else:
-                correct_order = False
-        else:
-            correct_order = False
-        
-        # Calculate format reward
-        format_score = 0.0
-        if has_think:
-            format_score += 0.3
-        if has_answer:
-            format_score += 0.3
-        if correct_order:
-            format_score += 0.4
+        if self.requires_thinking:
+            # Dataset requires thinking process
+            # Expected format: <think>...</think> <answer>...</answer>
             
-        return format_score
+            # Check for both patterns
+            think_pattern = r'<think>.*?</think>'
+            answer_pattern = r'<answer>.*?</answer>'
+            
+            think_match = re.search(think_pattern, text, re.DOTALL)
+            answer_match = re.search(answer_pattern, text, re.DOTALL)
+            
+            # Both must be present
+            if not (think_match and answer_match):
+                return 0.0
+            
+            # Check correct order (think before answer)
+            if think_match.end() > answer_match.start():
+                return 0.0
+            
+            # Check for unwanted content before <think>
+            think_start = think_match.start()
+            if think_start > 0 and text[:think_start].strip():
+                return 0.0  # Extra content before <think>
+            
+            # Check for unwanted content after </answer>
+            answer_end = answer_match.end()
+            if answer_end < len(text) and text[answer_end:].strip():
+                return 0.0  # Extra content after </answer>
+            
+            return 1.0
+            
+        else:
+            # Dataset does not require thinking process
+            # Expected format: <answer>...</answer> only
+            
+            answer_pattern = r'<answer>.*?</answer>'
+            answer_match = re.search(answer_pattern, text, re.DOTALL)
+            
+            # Answer tag must be present
+            if not answer_match:
+                return 0.0
+            
+            # Check for unwanted content before <answer>
+            answer_start = answer_match.start()
+            if answer_start > 0 and text[:answer_start].strip():
+                return 0.0  # Extra content before <answer>
+            
+            # Check for unwanted content after </answer>
+            answer_end = answer_match.end()
+            if answer_end < len(text) and text[answer_end:].strip():
+                return 0.0  # Extra content after </answer>
+            
+            # Check that there's no thinking tag (should be discouraged)
+            think_pattern = r'<think>.*?</think>'
+            if re.search(think_pattern, text, re.DOTALL):
+                return 0.0  # Thinking tag present when not expected
+            
+            return 1.0
     
     def compute_accuracy_reward(self, generated_text: str, ground_truth: str) -> float:
         """
@@ -276,56 +446,6 @@ class GRPOTrainer(Trainer):
         all_generated_ids = torch.cat(padded_ids, dim=0)
         
         return all_generated_texts, all_generated_ids
-
-    def compute_kl_penalty(
-        self, 
-        input_ids: torch.Tensor,
-        generated_ids: torch.Tensor,
-        batch: Dict[str, torch.Tensor]
-    ) -> torch.Tensor:
-        """Compute KL divergence between policy and reference model."""
-        self.model.eval()
-        self.ref_model.eval()
-        
-        with torch.no_grad():
-            # Get reference model logits
-            ref_outputs = self.ref_model(
-                input_ids=input_ids,
-                attention_mask=batch.get("attention_mask"),
-                position_ids=batch.get("position_ids"),
-                pixel_values=batch.get("pixel_values"),
-                image_grid_thw=batch.get("image_grid_thw"),
-                pixel_values_videos=batch.get("pixel_values_videos"),
-                video_grid_thw=batch.get("video_grid_thw"),
-            )
-            ref_logits = ref_outputs.logits
-            
-            # Get policy model logits
-            policy_outputs = self.model(
-                input_ids=input_ids,
-                attention_mask=batch.get("attention_mask"),
-                position_ids=batch.get("position_ids"),
-                pixel_values=batch.get("pixel_values"),
-                image_grid_thw=batch.get("image_grid_thw"),
-                pixel_values_videos=batch.get("pixel_values_videos"),
-                video_grid_thw=batch.get("video_grid_thw"),
-            )
-            policy_logits = policy_outputs.logits
-        
-        # Compute KL divergence for generated tokens only
-        gen_start = input_ids.shape[1] - generated_ids.shape[1]
-        ref_logits = ref_logits[:, gen_start:, :]
-        policy_logits = policy_logits[:, gen_start:, :]
-        
-        # Convert to probabilities
-        ref_probs = F.softmax(ref_logits, dim=-1)
-        policy_probs = F.softmax(policy_logits, dim=-1)
-        
-        # Compute KL divergence
-        kl = torch.sum(policy_probs * (torch.log(policy_probs + 1e-8) - torch.log(ref_probs + 1e-8)), dim=-1)
-        kl = kl.mean(dim=1)  # Average over sequence length
-        
-        return kl
     
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         """Compute GRPO loss while maintaining visual conditioning."""
@@ -354,8 +474,41 @@ class GRPOTrainer(Trainer):
         rewards = rewards.view(batch_size, self.args.grpo_sample_size)
         reward_advantages = rewards - rewards.mean(dim=1, keepdim=True)
         
+        # Collect individual reward components for logging
+        batch_format_rewards = []
+        batch_accuracy_rewards = []
+        for gen_text, gt_text in zip(generated_texts, ground_truths * self.args.grpo_sample_size):
+            format_reward = self.compute_format_reward(gen_text)
+            accuracy_reward = self.compute_accuracy_reward(gen_text, gt_text)
+            batch_format_rewards.append(format_reward)
+            batch_accuracy_rewards.append(accuracy_reward)
+        
+        # Save sample outputs to JSON (save every few steps to avoid too much I/O)
+        if self._global_step_count % (self.args.grpo_logging_steps * 2) == 0:
+            for i in range(min(batch_size, 2)):  # Save up to 2 samples per logging step
+                sample_idx = i * self.args.grpo_sample_size  # Take first sample for each input
+                prompt = self._extract_prompt_from_input(inputs["input_ids"][i])
+                gen_text = generated_texts[sample_idx]
+                gt_text = ground_truths[i]
+                format_reward = batch_format_rewards[sample_idx]
+                accuracy_reward = batch_accuracy_rewards[sample_idx]
+                
+                self.save_output_sample(
+                    prompt=prompt,
+                    generated_text=gen_text,
+                    ground_truth=gt_text,
+                    format_reward=format_reward,
+                    accuracy_reward=accuracy_reward,
+                    step=self.state.global_step
+                )
+        
         total_loss = 0.0
         model.train()
+        
+        # Lists to collect metrics for this batch
+        batch_policy_log_probs = []
+        batch_kl_divs = []
+        batch_advantages = []
         
         for i in range(batch_size):
             for j in range(self.args.grpo_sample_size):
@@ -430,16 +583,29 @@ class GRPOTrainer(Trainer):
                 ref_seq_log_prob = ref_token_log_probs.sum()
                 
                 # Compute KL divergence
-                kl_div = policy_seq_log_prob - ref_seq_log_prob
+                kl_div = torch.exp(ref_seq_log_prob - policy_seq_log_prob) - (ref_seq_log_prob - policy_seq_log_prob) - 1
                 
                 # GRPO Loss: -advantage * log_prob + beta * KL
                 advantage = reward_advantages[i, j]
                 sample_loss = -advantage * policy_seq_log_prob + self.args.grpo_beta * kl_div
                 
                 total_loss += sample_loss
+                
+                # Collect metrics for this batch
+                batch_policy_log_probs.append(policy_seq_log_prob.item())
+                batch_kl_divs.append(kl_div.item())
+                batch_advantages.append(advantage.item())
         
         # Average loss across all samples
         loss = total_loss / (batch_size * self.args.grpo_sample_size)
+        
+        # Log GRPO metrics for this batch
+        self.grpo_metrics['policy_seq_log_prob'].extend(batch_policy_log_probs)
+        self.grpo_metrics['kl_div'].extend(batch_kl_divs)
+        self.grpo_metrics['format_reward'].extend(batch_format_rewards)
+        self.grpo_metrics['accuracy_reward'].extend(batch_accuracy_rewards)
+        self.grpo_metrics['total_reward'].extend(rewards.flatten().cpu().tolist())
+        self.grpo_metrics['advantage'].extend(batch_advantages)
         
         return (loss, outputs) if return_outputs else loss
 
@@ -561,7 +727,7 @@ class GRPOTrainer(Trainer):
             with torch.no_grad():
                 generated_texts, _ = self.generate_responses(inputs)
                 
-            # Compute rewards
+            # Compute rewards and save samples during evaluation
             for i in range(batch_size):
                 gen_text = generated_texts[i * self.args.grpo_sample_size]  # Take first sample
                 gt_text = ground_truths[i]
@@ -572,6 +738,21 @@ class GRPOTrainer(Trainer):
                 total_format_reward += format_reward
                 total_accuracy_reward += accuracy_reward
                 total_samples += 1
+                
+                # Save evaluation samples (save a few for inspection)
+                if step < 5:  # Save first 5 batches during evaluation
+                    prompt = self._extract_prompt_from_input(inputs["input_ids"][i])
+                    self.save_output_sample(
+                        prompt=prompt,
+                        generated_text=gen_text,
+                        ground_truth=gt_text,
+                        format_reward=format_reward,
+                        accuracy_reward=accuracy_reward,
+                        step=f"eval_{self.state.global_step}_{step}_{i}"
+                    )
+        
+        # Flush any remaining outputs at end of evaluation
+        self._flush_outputs_to_file()
         
         # Add metrics to results
         eval_results.metrics[f"{metric_key_prefix}_format_reward"] = total_format_reward / total_samples
@@ -581,4 +762,30 @@ class GRPOTrainer(Trainer):
             self.args.accuracy_reward_weight * (total_accuracy_reward / total_samples)
         )
         
-        return eval_results 
+        # Log evaluation metrics directly to wandb using passed wandb_run instance
+        eval_metrics = {
+            f"{metric_key_prefix}/format_reward": total_format_reward / total_samples,
+            f"{metric_key_prefix}/accuracy_reward": total_accuracy_reward / total_samples,
+            f"{metric_key_prefix}/total_reward": (
+                self.args.format_reward_weight * (total_format_reward / total_samples) +
+                self.args.accuracy_reward_weight * (total_accuracy_reward / total_samples)
+            )
+        }
+        
+        try:
+            if self.wandb_run is not None:
+                self.wandb_run.log(eval_metrics, step=self.state.global_step)
+        except Exception as e:
+            print(f"Error logging evaluation metrics to wandb: {e}")
+        
+        return eval_results
+
+    def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
+        """Override save_model to also flush any remaining outputs."""
+        # Flush remaining outputs to file
+        self._flush_outputs_to_file()
+        
+        # Call parent save_model
+        super().save_model(output_dir, _internal_call)
+        
+        print(f"Model saved. Output samples saved to: {self.output_log_file}") 
