@@ -1,6 +1,6 @@
 ACCOUNT="edgeai_tao-ptm_image-foundation-model-clip"
 PARTITION="interactive_singlenode"
-IMAGE="nvcr.io/nvidian/iva/nvila-grpo:v1_20250504"
+IMAGE="christianlin0420/qwen25-vl-video:latest"
 JOB_NAME="qwen_2.5_vl_grpo_assy07"
 srun \
     --account=$ACCOUNT \
