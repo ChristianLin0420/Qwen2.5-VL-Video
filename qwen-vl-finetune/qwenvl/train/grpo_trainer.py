@@ -17,6 +17,7 @@ from collections import defaultdict
 import copy
 import wandb  # Add direct wandb import
 from datetime import datetime
+import contextlib
 
 from qwenvl.train.trainer import replace_qwen2_vl_attention_class
 from qwenvl.train.grpo_flash_attn_override import replace_qwen2_vl_attention_class_grpo
@@ -52,6 +53,7 @@ class GRPOTrainer(Trainer):
         self,
         model=None,
         args=None,
+        data_args=None,
         data_collator=None,
         train_dataset=None,
         eval_dataset=None,
@@ -98,13 +100,13 @@ class GRPOTrainer(Trainer):
         self._global_step_count = 0
         
         # Determine if dataset requires thinking process based on dataset name
-        dataset_name = getattr(args, 'dataset_use', '')
+        dataset_name = getattr(data_args, 'dataset_use', '')
         self.requires_thinking = 'no_think' not in dataset_name.lower()
         
         # Initialize JSON output logging
         self.output_log_file = os.path.join(args.output_dir, f"grpo_outputs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
         self.outputs_buffer = []
-        self.max_buffer_size = 50  # Save to file every 50 samples
+        self.max_buffer_size = 200  # Increased buffer size to handle more frequent saves
         
         # DON'T replace attention here - only during training
         
@@ -219,111 +221,91 @@ class GRPOTrainer(Trainer):
         
     def compute_format_reward(self, generated_text: str) -> float:
         """
-        Compute format reward based on dataset type and expected format.
-        - Thinking datasets: <think>...</think> <answer>...</answer>
-        - No-thinking datasets: <answer>...</answer> only
+        Compute format reward using standard VLM GRPO approach with exact pattern matching.
         Returns 1.0 for correct format, 0.0 otherwise.
         """
-        # Clean the generated text - strip whitespace
-        text = generated_text.strip()
+        # Clean the generated text
+        content = generated_text.strip()
         
         if self.requires_thinking:
-            # Dataset requires thinking process
-            # Expected format: <think>...</think> <answer>...</answer>
-            
-            # Check for both patterns
-            think_pattern = r'<think>.*?</think>'
-            answer_pattern = r'<answer>.*?</answer>'
-            
-            think_match = re.search(think_pattern, text, re.DOTALL)
-            answer_match = re.search(answer_pattern, text, re.DOTALL)
-            
-            # Both must be present
-            if not (think_match and answer_match):
-                return 0.0
-            
-            # Check correct order (think before answer)
-            if think_match.end() > answer_match.start():
-                return 0.0
-            
-            # Check for unwanted content before <think>
-            think_start = think_match.start()
-            if think_start > 0 and text[:think_start].strip():
-                return 0.0  # Extra content before <think>
-            
-            # Check for unwanted content after </answer>
-            answer_end = answer_match.end()
-            if answer_end < len(text) and text[answer_end:].strip():
-                return 0.0  # Extra content after </answer>
-            
-            return 1.0
-            
+            # Dataset requires thinking process: <think>...</think> <answer>...</answer>
+            pattern = r"<think>.*?</think>\s*<answer>.*?</answer>"
+            match = re.fullmatch(pattern, content, re.DOTALL)
+            return 1.0 if match else 0.0
         else:
-            # Dataset does not require thinking process
-            # Expected format: <answer>...</answer> only
-            
-            answer_pattern = r'<answer>.*?</answer>'
-            answer_match = re.search(answer_pattern, text, re.DOTALL)
-            
-            # Answer tag must be present
-            if not answer_match:
-                return 0.0
-            
-            # Check for unwanted content before <answer>
-            answer_start = answer_match.start()
-            if answer_start > 0 and text[:answer_start].strip():
-                return 0.0  # Extra content before <answer>
-            
-            # Check for unwanted content after </answer>
-            answer_end = answer_match.end()
-            if answer_end < len(text) and text[answer_end:].strip():
-                return 0.0  # Extra content after </answer>
-            
-            # Check that there's no thinking tag (should be discouraged)
-            think_pattern = r'<think>.*?</think>'
-            if re.search(think_pattern, text, re.DOTALL):
-                return 0.0  # Thinking tag present when not expected
-            
-            return 1.0
+            # Dataset does not require thinking process: <answer>...</answer> only
+            pattern = r"<answer>.*?</answer>"
+            match = re.fullmatch(pattern, content, re.DOTALL)
+            return 1.0 if match else 0.0
     
     def compute_accuracy_reward(self, generated_text: str, ground_truth: str) -> float:
         """
-        Compute accuracy reward based on whether the generated answer matches ground truth.
+        Compute accuracy reward using standard VLM GRPO approach with exact matching only.
+        Returns 1.0 for exact match, 0.0 otherwise (no partial rewards).
         """
-        # Extract answer from generated text
-        answer_pattern = r'<answer>(.*?)</answer>'
-        generated_match = re.search(answer_pattern, generated_text, re.DOTALL)
+        content = generated_text
+        sol = ground_truth
+        reward = 0.0
         
-        if not generated_match:
-            return 0.0
+        # First try action-based verification (our domain-specific logic)
+        try:
+            # Extract answer from generated text
+            content_match = re.search(r'<answer>(.*?)</answer>', content, re.DOTALL)
+            student_answer = content_match.group(1).strip() if content_match else content.strip()
             
-        generated_answer = generated_match.group(1).strip()
+            # Extract answer from ground truth 
+            sol_match = re.search(r'<answer>(.*?)</answer>', sol, re.DOTALL)
+            ground_truth_answer = sol_match.group(1).strip() if sol_match else sol.strip()
+            
+            # Extract action numbers for exact matching only
+            def extract_actions(text):
+                actions = re.findall(r'\((\d+)\)', text)
+                return sorted(actions)
+            
+            generated_actions = extract_actions(student_answer)
+            gt_actions = extract_actions(ground_truth_answer)
+            
+            # Check for EXACT action match only (no partial rewards)
+            if generated_actions == gt_actions and len(generated_actions) > 0:
+                reward = 1.0
+            # Remove partial matching - only exact match gets reward
+            
+        except Exception:
+            pass  # Continue to next verification method if this fails
         
-        # Extract answer from ground truth
-        gt_match = re.search(answer_pattern, ground_truth, re.DOTALL)
-        if gt_match:
-            gt_answer = gt_match.group(1).strip()
-        else:
-            gt_answer = ground_truth.strip()
+        # If action-based verification failed, try normalized string matching (standard VLM approach)
+        if reward == 0.0:
+            try:
+                # Extract answer from solution if it has think/answer tags
+                sol_match = re.search(r'<answer>(.*?)</answer>', sol, re.DOTALL)
+                ground_truth_answer = sol_match.group(1).strip() if sol_match else sol.strip()
+                
+                # Extract answer from content if it has think/answer tags  
+                content_match = re.search(r'<answer>(.*?)</answer>', content, re.DOTALL)
+                student_answer = content_match.group(1).strip() if content_match else content.strip()
+                
+                # Normalize both answers (standard VLM GRPO approach)
+                ground_truth_norm = ground_truth_answer.replace(' ', '').replace('_', '').lower()
+                student_answer_norm = student_answer.replace(' ', '').replace('_', '').lower()
+                
+                # Exact match only (no partial rewards)
+                if ground_truth_norm == student_answer_norm and len(ground_truth_norm) > 0:
+                    reward = 1.0
+                # Remove bidirectional substring matching - only exact match gets reward
+                
+            except Exception:
+                pass  # Keep reward as 0.0 if both methods fail
         
-        # Normalize answers - extract action numbers
-        def extract_actions(text):
-            # Pattern to match action numbers like (1), (2), etc.
-            actions = re.findall(r'\((\d+)\)', text)
-            return sorted(actions)
+        # Optional debug logging (following standard implementation)
+        if os.getenv("DEBUG_MODE") == "true":
+            log_path = os.getenv("LOG_PATH", "grpo_debug.log")
+            current_time = datetime.now().strftime("%d-%H-%M-%S-%f")
+            with open(log_path, "a") as f:
+                f.write(f"------------- {current_time} Accuracy reward: {reward} -------------\n")
+                f.write(f"content: {content}\n")
+                f.write(f"sol: {sol}\n")
         
-        generated_actions = extract_actions(generated_answer)
-        gt_actions = extract_actions(gt_answer)
-        
-        # Calculate accuracy
-        if generated_actions == gt_actions:
-            return 1.0
-        elif set(generated_actions) & set(gt_actions):  # Partial match
-            intersection = len(set(generated_actions) & set(gt_actions))
-            union = len(set(generated_actions) | set(gt_actions))
-            return intersection / union if union > 0 else 0.0
-        else:
-            return 0.0
+        return reward
     
     def compute_rewards(self, generated_texts: List[str], ground_truths: List[str]) -> torch.Tensor:
         """Compute combined rewards for generated texts."""
@@ -342,139 +324,351 @@ class GRPOTrainer(Trainer):
             
         return torch.tensor(rewards, device=self.model.device)
     
-    def generate_responses(self, batch: Dict[str, torch.Tensor]) -> Tuple[List[str], torch.Tensor]:
-        """Generate multiple responses for each input in the batch."""
+    def _get_per_token_logps(self, model, input_ids, attention_mask, pixel_values=None, image_grid_thw=None, pixel_values_videos=None, video_grid_thw=None):
+        """
+        Compute per-token log probabilities for the given input sequence.
+        Returns log probabilities shifted for causal language modeling.
+        """
+        model_inputs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        }
+        
+        # Add visual inputs if provided
+        if pixel_values is not None:
+            model_inputs["pixel_values"] = pixel_values
+        if image_grid_thw is not None:
+            model_inputs["image_grid_thw"] = image_grid_thw
+        if pixel_values_videos is not None:
+            model_inputs["pixel_values_videos"] = pixel_values_videos
+        if video_grid_thw is not None:
+            model_inputs["video_grid_thw"] = video_grid_thw
+            
+        with torch.no_grad() if model != self.model else contextlib.nullcontext():
+            outputs = model(**model_inputs)
+        
+        logits = outputs.logits  # (batch_size, seq_len, vocab_size)
+        
+        # Shift logits and input_ids for causal LM
+        shift_logits = logits[:, :-1, :].contiguous()  # (batch_size, seq_len-1, vocab_size)
+        shift_labels = input_ids[:, 1:].contiguous()   # (batch_size, seq_len-1)
+        
+        # Compute log probabilities
+        log_probs = F.log_softmax(shift_logits, dim=-1)  # (batch_size, seq_len-1, vocab_size)
+        per_token_logps = log_probs.gather(dim=-1, index=shift_labels.unsqueeze(-1)).squeeze(-1)
+        
+        return per_token_logps  # (batch_size, seq_len-1)
+
+    def generate_responses_batch(self, inputs: Dict[str, torch.Tensor]) -> Tuple[List[str], torch.Tensor, torch.Tensor]:
+        """
+        Generate multiple responses for each input in batch, following standard GRPO approach.
+        Returns: (generated_texts, completion_ids, prompt_lengths)
+        """
         self.model.eval()
         
-        input_ids = batch["input_ids"]
-        batch_size = input_ids.shape[0]
+        batch_size = inputs["input_ids"].shape[0]
+        input_ids = inputs["input_ids"]
         
-        # Check if we're using flattened data format
-        is_flattened = "attention_mask" in batch and batch["attention_mask"].dim() == 1
-        
-        # Find where the assistant response should start
-        eos_token_id = self.processing_class.eos_token_id
+        # Find prompt lengths (before assistant response)
         assistant_token = "<|im_start|>assistant\n"
         assistant_ids = self.processing_class.encode(assistant_token, add_special_tokens=False)
         
-        # Generate multiple samples per input
+        prompt_lengths = []
+        for i in range(batch_size):
+            seq = input_ids[i].cpu().tolist()
+            prompt_length = len(seq)
+            
+            # Find assistant marker
+            for j in range(len(seq) - len(assistant_ids), -1, -1):
+                if j >= 0 and seq[j:j+len(assistant_ids)] == assistant_ids:
+                    prompt_length = j + len(assistant_ids)
+                    break
+            prompt_lengths.append(prompt_length)
+        
+        # Generate responses one by one to avoid video tensor issues
         all_generated_texts = []
-        all_generated_ids = []
+        all_completion_ids = []
         
         with torch.no_grad():
             for i in range(batch_size):
-                # Find the position to start generation
-                single_input_ids = input_ids[i:i+1]
+                # Prepare inputs for single sample
+                single_inputs = {}
+                prompt_len = prompt_lengths[i]
                 
-                # Find where to cut off for generation (before assistant response)
-                seq = single_input_ids[0].cpu().tolist()
-                cut_position = len(seq)
+                for key, value in inputs.items():
+                    if value is not None:
+                        if key in ["input_ids", "attention_mask"]:
+                            # Handle different tensor dimensions
+                            if value.dim() == 1:
+                                # 1D tensor (flattened format) - skip for generation
+                                continue
+                            elif value.dim() == 2:
+                                # 2D tensor (standard format) - truncate to prompt
+                                single_inputs[key] = value[i:i+1, :prompt_len]
+                            else:
+                                continue
+                        elif key in ["pixel_values", "image_grid_thw"]:
+                            # Use original visual inputs for this sample
+                            if value.dim() > 1 and value.shape[0] == batch_size:
+                                single_inputs[key] = value[i:i+1]
+                            else:
+                                single_inputs[key] = value
+                        elif key in ["pixel_values_videos", "video_grid_thw"]:
+                            # Keep video inputs as-is (don't repeat/modify them)
+                            single_inputs[key] = value
                 
-                # Search for the last occurrence of assistant marker (search backwards)
-                for j in range(len(seq) - len(assistant_ids), -1, -1):
-                    if j >= 0 and seq[j:j+len(assistant_ids)] == assistant_ids:
-                        # Found assistant marker, cut just before it
-                        cut_position = j
-                        break
+                # Create proper attention masks if not present
+                if "attention_mask" not in single_inputs and "input_ids" in single_inputs:
+                    single_inputs["attention_mask"] = torch.ones_like(single_inputs["input_ids"], dtype=torch.bool)
                 
-                # Prepare generation input
-                gen_input_ids = single_input_ids[:, :cut_position]
-                
-                # Prepare other inputs based on data format
-                gen_batch = {
-                    "input_ids": gen_input_ids,
-                }
-                
-                if is_flattened:
-                    # For flattened format, create standard attention mask for generation
-                    gen_batch["attention_mask"] = torch.ones_like(gen_input_ids, dtype=torch.bool)
-                    # Handle position_ids for flattened format
-                    if "position_ids" in batch and batch["position_ids"] is not None:
-                        # Position IDs are 3D: [3, batch_size, seq_len]
-                        gen_batch["position_ids"] = batch["position_ids"][:, i:i+1, :cut_position]
-                else:
-                    # Standard format
-                    gen_batch["attention_mask"] = batch["attention_mask"][i:i+1, :cut_position] if "attention_mask" in batch else None
-                    gen_batch["position_ids"] = batch["position_ids"][i:i+1, :cut_position] if "position_ids" in batch else None
-                
-                # Add visual inputs if present
-                if "pixel_values" in batch and batch["pixel_values"] is not None:
-                    gen_batch["pixel_values"] = batch["pixel_values"][i:i+1] if batch["pixel_values"].dim() > 1 else batch["pixel_values"]
-                    if "image_grid_thw" in batch and batch["image_grid_thw"] is not None:
-                        gen_batch["image_grid_thw"] = batch["image_grid_thw"][i:i+1] if batch["image_grid_thw"].dim() > 1 else batch["image_grid_thw"]
-                        
-                if "pixel_values_videos" in batch and batch["pixel_values_videos"] is not None:
-                    # Handle video data - might be already extracted for the specific sample
-                    if i == 0 and batch["pixel_values_videos"].shape[0] > 0:
-                        gen_batch["pixel_values_videos"] = batch["pixel_values_videos"]
-                        if "video_grid_thw" in batch and batch["video_grid_thw"] is not None:
-                            gen_batch["video_grid_thw"] = batch["video_grid_thw"]
-                
-                # Generate multiple samples
+                # Generate multiple samples for this input
                 for _ in range(self.args.grpo_sample_size):
-                    outputs = self.model.generate(
-                        **gen_batch,
+                    sample_outputs = self.model.generate(
+                        **single_inputs,
                         max_new_tokens=self.args.generation_max_length,
                         temperature=self.args.generation_temperature,
                         top_p=self.args.generation_top_p,
                         num_beams=self.args.generation_num_beams,
                         do_sample=True,
                         pad_token_id=self.processing_class.pad_token_id,
-                        eos_token_id=eos_token_id,
+                        eos_token_id=self.processing_class.eos_token_id,
+                        return_dict_in_generate=False,
                     )
                     
                     # Extract only the generated part
-                    generated_ids = outputs[:, gen_input_ids.shape[1]:]
-                    generated_text = self.processing_class.decode(generated_ids[0], skip_special_tokens=True)
+                    completion_ids = sample_outputs[0, prompt_len:]
+                    completion_text = self.processing_class.decode(completion_ids, skip_special_tokens=True)
                     
-                    all_generated_texts.append(generated_text)
-                    all_generated_ids.append(generated_ids)
+                    all_generated_texts.append(completion_text)
+                    all_completion_ids.append(completion_ids)
         
-        # Stack all generated ids
-        max_len = max(ids.shape[1] for ids in all_generated_ids)
-        padded_ids = []
-        for ids in all_generated_ids:
-            if ids.shape[1] < max_len:
+        # Pad completion ids to same length
+        max_completion_len = max(ids.shape[0] for ids in all_completion_ids)
+        padded_completions = []
+        
+        for ids in all_completion_ids:
+            if ids.shape[0] < max_completion_len:
                 padding = torch.full(
-                    (ids.shape[0], max_len - ids.shape[1]), 
+                    (max_completion_len - ids.shape[0],),
                     self.processing_class.pad_token_id,
                     device=ids.device
                 )
-                ids = torch.cat([ids, padding], dim=1)
-            padded_ids.append(ids)
+                ids = torch.cat([ids, padding])
+            padded_completions.append(ids)
         
-        all_generated_ids = torch.cat(padded_ids, dim=0)
+        completion_ids = torch.stack(padded_completions, dim=0)  # (B*G, C)
+        prompt_lengths_tensor = torch.tensor(prompt_lengths, device=self.model.device)
         
-        return all_generated_texts, all_generated_ids
-    
+        return all_generated_texts, completion_ids, prompt_lengths_tensor
+
+    def generate_responses_eval(self, inputs: Dict[str, torch.Tensor]) -> List[str]:
+        """
+        Generate single response per input for evaluation (more efficient).
+        Returns: generated_texts
+        """
+        self.model.eval()
+        
+        batch_size = inputs["input_ids"].shape[0]
+        input_ids = inputs["input_ids"]
+        
+        # Find prompt lengths (before assistant response)
+        assistant_token = "<|im_start|>assistant\n"
+        assistant_ids = self.processing_class.encode(assistant_token, add_special_tokens=False)
+        
+        # Generate responses one by one to avoid video tensor issues
+        all_generated_texts = []
+        
+        with torch.no_grad():
+            for i in range(batch_size):
+                # Prepare inputs for single sample
+                single_inputs = {}
+                
+                # Find prompt length for this sample
+                seq = input_ids[i].cpu().tolist()
+                prompt_length = len(seq)
+                for j in range(len(seq) - len(assistant_ids), -1, -1):
+                    if j >= 0 and seq[j:j+len(assistant_ids)] == assistant_ids:
+                        prompt_length = j + len(assistant_ids)
+                        break
+                
+                for key, value in inputs.items():
+                    if value is not None and key in ["input_ids", "attention_mask"]:
+                        # Handle different tensor dimensions
+                        if value.dim() == 1:
+                            # 1D tensor (flattened format) - skip for generation
+                            continue
+                        elif value.dim() == 2:
+                            # 2D tensor (standard format) - truncate to prompt
+                            single_inputs[key] = value[i:i+1, :prompt_length]
+                        else:
+                            # Skip other dimensions
+                            continue
+                    elif value is not None and key in ["pixel_values", "image_grid_thw"]:
+                        # Use original visual inputs for this sample
+                        if value.dim() > 1 and value.shape[0] == batch_size:
+                            single_inputs[key] = value[i:i+1]
+                        else:
+                            single_inputs[key] = value
+                    elif value is not None and key in ["pixel_values_videos", "video_grid_thw"]:
+                        # Keep video inputs as-is (don't repeat/modify them)
+                        single_inputs[key] = value
+                
+                # Create proper attention masks if not present
+                if "attention_mask" not in single_inputs and "input_ids" in single_inputs:
+                    single_inputs["attention_mask"] = torch.ones_like(single_inputs["input_ids"], dtype=torch.bool)
+                
+                # Generate single response for this input
+                outputs = self.model.generate(
+                    **single_inputs,
+                    max_new_tokens=self.args.generation_max_length,
+                    temperature=0.1,  # Lower temperature for more deterministic eval
+                    top_p=0.9,
+                    num_beams=1,
+                    do_sample=True,
+                    pad_token_id=self.processing_class.pad_token_id,
+                    eos_token_id=self.processing_class.eos_token_id,
+                    return_dict_in_generate=False,
+                )
+                
+                # Extract generated completion
+                completion_ids = outputs[0, prompt_length:]
+                completion_text = self.processing_class.decode(completion_ids, skip_special_tokens=True)
+                all_generated_texts.append(completion_text)
+        
+        return all_generated_texts
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        """Compute GRPO loss while maintaining visual conditioning."""
-        
-        # DON'T apply GRPO flash attention override during loss computation
-        # because we're modifying sequence lengths
+        """Compute GRPO loss using efficient vectorized operations following standard approach."""
         
         # Get ground truth and generate responses
         labels = inputs.get("labels")
         batch_size = inputs["input_ids"].shape[0]
+        device = self.model.device
         
         ground_truths = self._extract_ground_truths(labels)
         
-        # Apply GRPO flash attention override ONLY for generation
+        # Apply GRPO flash attention override for generation
         from qwenvl.train.grpo_flash_attn_override import replace_qwen2_vl_attention_class_grpo
         replace_qwen2_vl_attention_class_grpo()
         
-        generated_texts, generated_ids = self.generate_responses(inputs)
+        # Generate responses using efficient batch approach
+        generated_texts, completion_ids, prompt_lengths = self.generate_responses_batch(inputs)
         
-        # Restore standard flash attention for loss computation
-        # from qwenvl.train.trainer import replace_qwen2_vl_attention_class
-        # replace_qwen2_vl_attention_class()
-        
-        # Compute rewards and advantages
+        # Compute rewards
         rewards = self.compute_rewards(generated_texts, ground_truths * self.args.grpo_sample_size)
-        rewards = rewards.view(batch_size, self.args.grpo_sample_size)
-        reward_advantages = rewards - rewards.mean(dim=1, keepdim=True)
         
-        # Collect individual reward components for logging
+        # Mask everything after the first EOS token for each completion
+        is_eos = completion_ids == self.processing_class.eos_token_id
+        eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
+        eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
+        sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
+        completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
+        
+        # Compute grouped-wise rewards and advantages
+        rewards_grouped = rewards.view(batch_size, self.args.grpo_sample_size)  # (B, G)
+        mean_grouped_rewards = rewards_grouped.mean(dim=1)  # (B,)
+        std_grouped_rewards = rewards_grouped.std(dim=1)  # (B,)
+        
+        # Normalize rewards to compute advantages
+        mean_expanded = mean_grouped_rewards.repeat_interleave(self.args.grpo_sample_size, dim=0)  # (B*G,)
+        std_expanded = std_grouped_rewards.repeat_interleave(self.args.grpo_sample_size, dim=0)  # (B*G,)
+        advantages = (rewards - mean_expanded) / (std_expanded + 1e-4)  # (B*G,)
+        
+        # Compute per-token log probabilities by replacing assistant responses in original sequences
+        total_loss = 0.0
+        
+        # Collect metrics for logging
+        batch_policy_log_probs = []
+        batch_kl_divs = []
+        batch_advantages = []
+        
+        for i in range(batch_size):
+            for j in range(self.args.grpo_sample_size):
+                sample_idx = i * self.args.grpo_sample_size + j
+                
+                # Create modified sequence with generated completion
+                modified_input_ids, modified_labels = self._create_modified_sequence(
+                    inputs["input_ids"][i], labels[i], completion_ids[sample_idx], prompt_lengths[i]
+                )
+                
+                # Create inputs for model forward pass (keep original format)
+                model_inputs = {
+                    "input_ids": modified_input_ids.unsqueeze(0),
+                    "attention_mask": torch.ones_like(modified_input_ids, dtype=torch.bool).unsqueeze(0),
+                }
+                
+                # Add visual inputs (use original ones - don't modify)
+                if "pixel_values" in inputs and inputs["pixel_values"] is not None:
+                    model_inputs["pixel_values"] = inputs["pixel_values"][i:i+1]
+                if "image_grid_thw" in inputs and inputs["image_grid_thw"] is not None:
+                    model_inputs["image_grid_thw"] = inputs["image_grid_thw"][i:i+1]
+                if "pixel_values_videos" in inputs and inputs["pixel_values_videos"] is not None:
+                    model_inputs["pixel_values_videos"] = inputs["pixel_values_videos"]
+                if "video_grid_thw" in inputs and inputs["video_grid_thw"] is not None:
+                    model_inputs["video_grid_thw"] = inputs["video_grid_thw"]
+                
+                # Forward pass through policy model
+                outputs = model(**model_inputs)
+                policy_logits = outputs.logits[0]  # Remove batch dimension
+                
+                # Forward pass through reference model
+                with torch.inference_mode():
+                    ref_outputs = self.ref_model(**model_inputs)
+                    ref_logits = ref_outputs.logits[0]  # Remove batch dimension
+                
+                # Find completion token positions
+                completion_start = prompt_lengths[i].item()
+                completion_end = completion_start + completion_mask[sample_idx].sum().item()
+                
+                if completion_start >= completion_end:
+                    continue  # Skip if no completion tokens
+                
+                # Extract logits for completion tokens (shift for causal LM)
+                policy_completion_logits = policy_logits[completion_start-1:completion_end-1, :]
+                ref_completion_logits = ref_logits[completion_start-1:completion_end-1, :]
+                
+                # Get target tokens
+                target_tokens = modified_input_ids[completion_start:completion_end]
+                
+                # Compute log probabilities
+                policy_log_probs = F.log_softmax(policy_completion_logits, dim=-1)
+                ref_log_probs = F.log_softmax(ref_completion_logits, dim=-1)
+                
+                # Get log probabilities for actual tokens
+                policy_token_log_probs = policy_log_probs.gather(1, target_tokens.unsqueeze(-1)).squeeze(-1)
+                ref_token_log_probs = ref_log_probs.gather(1, target_tokens.unsqueeze(-1)).squeeze(-1)
+                
+                # Apply completion mask to valid tokens only
+                valid_mask = completion_mask[sample_idx][:len(policy_token_log_probs)].float()
+                
+                # Compute sequence log probabilities (sum over valid tokens)
+                policy_seq_log_prob = (policy_token_log_probs * valid_mask).sum()
+                ref_seq_log_prob = (ref_token_log_probs * valid_mask).sum()
+                
+                # Compute per-token KL divergence 
+                per_token_kl = torch.exp(ref_token_log_probs - policy_token_log_probs) - \
+                              (ref_token_log_probs - policy_token_log_probs) - 1
+                
+                # GRPO loss computation (following standard implementation)
+                advantage = advantages[sample_idx]
+                
+                # Per-token loss with advantage weighting
+                per_token_loss = torch.exp(policy_token_log_probs - policy_token_log_probs.detach()) * advantage
+                per_token_loss = -(per_token_loss - self.args.grpo_beta * per_token_kl)
+                
+                # Average loss over valid tokens
+                sample_loss = (per_token_loss * valid_mask).sum() / valid_mask.sum()
+                total_loss += sample_loss
+                
+                # Collect metrics
+                batch_policy_log_probs.append(policy_seq_log_prob.item())
+                batch_kl_divs.append((per_token_kl * valid_mask).sum().item() / valid_mask.sum().item())
+                batch_advantages.append(advantage.item())
+        
+        # Average loss across all samples
+        loss = total_loss / (batch_size * self.args.grpo_sample_size)
+        
+        # Add reward metrics
         batch_format_rewards = []
         batch_accuracy_rewards = []
         for gen_text, gt_text in zip(generated_texts, ground_truths * self.args.grpo_sample_size):
@@ -483,172 +677,75 @@ class GRPOTrainer(Trainer):
             batch_format_rewards.append(format_reward)
             batch_accuracy_rewards.append(accuracy_reward)
         
-        # Save sample outputs to JSON (save every few steps to avoid too much I/O)
-        if self._global_step_count % (self.args.grpo_logging_steps * 2) == 0:
-            for i in range(min(batch_size, 2)):  # Save up to 2 samples per logging step
-                sample_idx = i * self.args.grpo_sample_size  # Take first sample for each input
-                prompt = self._extract_prompt_from_input(inputs["input_ids"][i])
-                gen_text = generated_texts[sample_idx]
-                gt_text = ground_truths[i]
-                format_reward = batch_format_rewards[sample_idx]
-                accuracy_reward = batch_accuracy_rewards[sample_idx]
-                
-                self.save_output_sample(
-                    prompt=prompt,
-                    generated_text=gen_text,
-                    ground_truth=gt_text,
-                    format_reward=format_reward,
-                    accuracy_reward=accuracy_reward,
-                    step=self.state.global_step
-                )
-        
-        total_loss = 0.0
-        model.train()
-        
-        # Lists to collect metrics for this batch
-        batch_policy_log_probs = []
-        batch_kl_divs = []
-        batch_advantages = []
-        
-        for i in range(batch_size):
-            for j in range(self.args.grpo_sample_size):
-                idx = i * self.args.grpo_sample_size + j
-                sample_generated_ids = generated_ids[idx:idx+1]
-                
-                # Use original sequence structure, replace assistant response
-                modified_input_ids, modified_labels = self._replace_assistant_response(
-                    inputs["input_ids"][i:i+1], 
-                    labels[i:i+1], 
-                    sample_generated_ids
-                )
-
-                modified_input_ids = inputs["input_ids"][i:i+1]
-                modified_labels = labels[i:i+1]
-                
-                # Create standard attention mask for modified sequence
-                modified_attention_mask = torch.ones_like(modified_input_ids, dtype=torch.bool)
-                
-                # Forward pass with standard attention (no cu_seqlens)
-                outputs = model(
-                    input_ids=modified_input_ids,
-                    labels=modified_labels,
-                    attention_mask=modified_attention_mask,
-                    # Don't use position_ids from flattened format
-                    pixel_values=inputs.get("pixel_values")[i:i+1] if "pixel_values" in inputs and inputs["pixel_values"] is not None else None,
-                    image_grid_thw=inputs.get("image_grid_thw")[i:i+1] if "image_grid_thw" in inputs and inputs["image_grid_thw"] is not None else None,
-                    pixel_values_videos=inputs.get("pixel_values_videos") if "pixel_values_videos" in inputs and inputs["pixel_values_videos"] is not None else None,
-                    video_grid_thw=inputs.get("video_grid_thw") if "video_grid_thw" in inputs and inputs["video_grid_thw"] is not None else None,
-                )
-                
-                # Reference model with standard attention
-                with torch.no_grad():
-                    ref_outputs = self.ref_model(
-                        input_ids=modified_input_ids,
-                        attention_mask=modified_attention_mask,
-                        pixel_values=inputs.get("pixel_values")[i:i+1] if "pixel_values" in inputs and inputs["pixel_values"] is not None else None,
-                        image_grid_thw=inputs.get("image_grid_thw")[i:i+1] if "image_grid_thw" in inputs and inputs["image_grid_thw"] is not None else None,
-                        pixel_values_videos=inputs.get("pixel_values_videos") if "pixel_values_videos" in inputs and inputs["pixel_values_videos"] is not None else None,
-                        video_grid_thw=inputs.get("video_grid_thw") if "video_grid_thw" in inputs and inputs["video_grid_thw"] is not None else None,
-                    )
-                
-                # ===== GRPO LOSS CALCULATION =====
-                
-                # Get logits for generated tokens only
-                policy_logits = outputs.logits
-                ref_logits = ref_outputs.logits
-                
-                # Find the positions of generated tokens
-                gen_start, gen_end = self._find_generated_token_positions(modified_labels[0])
-                
-                if gen_start >= gen_end:
-                    continue  # Skip if no generated tokens
-                
-                # Extract logits for generated sequence (shift by 1 for causal LM)
-                policy_gen_logits = policy_logits[0, gen_start-1:gen_end-1, :]  # [seq_len, vocab_size]
-                ref_gen_logits = ref_logits[0, gen_start-1:gen_end-1, :]
-                
-                # Get target tokens
-                target_tokens = modified_input_ids[0, gen_start:gen_end]  # [seq_len]
-                
-                # Compute log probabilities
-                policy_log_probs = F.log_softmax(policy_gen_logits, dim=-1)  # [seq_len, vocab_size]
-                ref_log_probs = F.log_softmax(ref_gen_logits, dim=-1)
-                
-                # Get log probabilities for actual tokens
-                policy_token_log_probs = policy_log_probs.gather(1, target_tokens.unsqueeze(-1)).squeeze(-1)  # [seq_len]
-                ref_token_log_probs = ref_log_probs.gather(1, target_tokens.unsqueeze(-1)).squeeze(-1)
-                
-                # Sum log probabilities over sequence length
-                policy_seq_log_prob = policy_token_log_probs.sum()  # Scalar
-                ref_seq_log_prob = ref_token_log_probs.sum()
-                
-                # Compute KL divergence
-                kl_div = torch.exp(ref_seq_log_prob - policy_seq_log_prob) - (ref_seq_log_prob - policy_seq_log_prob) - 1
-                
-                # GRPO Loss: -advantage * log_prob + beta * KL
-                advantage = reward_advantages[i, j]
-                sample_loss = -advantage * policy_seq_log_prob + self.args.grpo_beta * kl_div
-                
-                total_loss += sample_loss
-                
-                # Collect metrics for this batch
-                batch_policy_log_probs.append(policy_seq_log_prob.item())
-                batch_kl_divs.append(kl_div.item())
-                batch_advantages.append(advantage.item())
-        
-        # Average loss across all samples
-        loss = total_loss / (batch_size * self.args.grpo_sample_size)
-        
         # Log GRPO metrics for this batch
         self.grpo_metrics['policy_seq_log_prob'].extend(batch_policy_log_probs)
         self.grpo_metrics['kl_div'].extend(batch_kl_divs)
         self.grpo_metrics['format_reward'].extend(batch_format_rewards)
         self.grpo_metrics['accuracy_reward'].extend(batch_accuracy_rewards)
-        self.grpo_metrics['total_reward'].extend(rewards.flatten().cpu().tolist())
+        self.grpo_metrics['total_reward'].extend(rewards.cpu().tolist())
         self.grpo_metrics['advantage'].extend(batch_advantages)
         
-        return (loss, outputs) if return_outputs else loss
+        # Save all sample outputs for complete tracking
+        for i in range(batch_size):
+            sample_idx = i * self.args.grpo_sample_size
+            prompt = self._extract_prompt_from_input(inputs["input_ids"][i])
+            gen_text = generated_texts[sample_idx]
+            gt_text = ground_truths[i]
+            format_reward = batch_format_rewards[sample_idx]
+            accuracy_reward = batch_accuracy_rewards[sample_idx]
+            
+            self.save_output_sample(
+                prompt=prompt,
+                generated_text=gen_text,
+                ground_truth=gt_text,
+                format_reward=format_reward,
+                accuracy_reward=accuracy_reward,
+                step=self.state.global_step
+            )
+        
+        model.train()
+        
+        return (loss, None) if return_outputs else loss
 
-    def _extract_ground_truths(self, labels):
-        """Extract ground truth texts from labels."""
-        ground_truths = []
-        for i in range(labels.shape[0]):
-            label_seq = labels[i]
-            valid_labels = label_seq[label_seq != -100]
-            if len(valid_labels) > 0:
-                gt_text = self.processing_class.decode(valid_labels, skip_special_tokens=True)
-            else:
-                gt_text = ""
-            ground_truths.append(gt_text)
-        return ground_truths
-
-    def _replace_assistant_response(self, input_ids, labels, generated_ids):
-        """Replace assistant response in original sequence while keeping same length."""
+    def _create_modified_sequence(self, original_input_ids, original_labels, completion_ids, prompt_length):
+        """
+        Create a modified sequence by replacing the assistant response with generated completion.
+        Maintains original sequence structure for video compatibility.
+        """
+        prompt_len = prompt_length.item()
         
-        # Find assistant response boundaries in original sequence
-        assistant_start, assistant_end = self._find_assistant_boundaries(input_ids[0])
+        # Find original assistant response boundaries
+        assistant_start, assistant_end = self._find_assistant_boundaries(original_input_ids)
         
-        # Create new input_ids with generated response
-        new_input_ids = input_ids.clone()
-        gen_length = generated_ids.shape[1]
-        
-        if assistant_end - assistant_start >= gen_length:
-            # Replace part of the assistant response
-            new_input_ids[0, assistant_start:assistant_start+gen_length] = generated_ids[0]
-            # Pad the rest if needed
-            if assistant_end - assistant_start > gen_length:
-                new_input_ids[0, assistant_start+gen_length:assistant_end] = self.processing_class.pad_token_id
+        # Create new sequence: prompt + generated completion + padding/truncation as needed
+        if assistant_start == len(original_input_ids):
+            # No assistant response found, append completion
+            modified_input_ids = torch.cat([
+                original_input_ids[:prompt_len],
+                completion_ids
+            ])
         else:
-            # Truncate generated response to fit
-            new_input_ids[0, assistant_start:assistant_end] = generated_ids[0, :assistant_end-assistant_start]
+            # Replace existing assistant response
+            max_completion_len = assistant_end - assistant_start
+            if len(completion_ids) <= max_completion_len:
+                # Completion fits in original space
+                modified_input_ids = original_input_ids.clone()
+                modified_input_ids[assistant_start:assistant_start + len(completion_ids)] = completion_ids
+                # Pad remaining space if needed
+                if len(completion_ids) < max_completion_len:
+                    modified_input_ids[assistant_start + len(completion_ids):assistant_end] = self.processing_class.pad_token_id
+            else:
+                # Truncate completion to fit
+                modified_input_ids = original_input_ids.clone()
+                modified_input_ids[assistant_start:assistant_end] = completion_ids[:max_completion_len]
         
-        # Create corresponding labels (only compute loss on generated part)
-        new_labels = torch.full_like(new_input_ids, -100)
-        actual_gen_length = min(gen_length, assistant_end - assistant_start)
-        new_labels[0, assistant_start:assistant_start+actual_gen_length] = \
-            new_input_ids[0, assistant_start:assistant_start+actual_gen_length]
+        # Create labels for loss computation (only on generated tokens)
+        modified_labels = torch.full_like(modified_input_ids, -100)
+        actual_completion_len = min(len(completion_ids), assistant_end - assistant_start if assistant_start < len(original_input_ids) else len(completion_ids))
+        modified_labels[assistant_start:assistant_start + actual_completion_len] = \
+            modified_input_ids[assistant_start:assistant_start + actual_completion_len]
         
-        return new_input_ids, new_labels
+        return modified_input_ids, modified_labels
 
     def _find_assistant_boundaries(self, input_ids):
         """Find start and end positions of assistant response."""
@@ -660,7 +757,7 @@ class GRPOTrainer(Trainer):
         
         # Find assistant start
         assistant_start = None
-        for j in range(len(seq) - len(assistant_ids)):
+        for j in range(len(seq) - len(assistant_ids) + 1):
             if seq[j:j+len(assistant_ids)] == assistant_ids:
                 assistant_start = j + len(assistant_ids)
                 break
@@ -675,17 +772,40 @@ class GRPOTrainer(Trainer):
         
         return assistant_start or len(seq), assistant_end
 
-    def _find_generated_token_positions(self, labels):
-        """Find start and end positions of tokens to compute loss on."""
-        valid_positions = (labels != -100).nonzero(as_tuple=True)[0]
+    def _extract_ground_truths(self, labels):
+        """Extract ground truth texts from labels and clean up concatenated answers."""
+        ground_truths = []
+        for i in range(labels.shape[0]):
+            label_seq = labels[i]
+            valid_labels = label_seq[label_seq != -100]
+            if len(valid_labels) > 0:
+                gt_text = self.processing_class.decode(valid_labels, skip_special_tokens=True)
+                
+                # Clean up concatenated answers - extract the first complete answer
+                gt_text = self._clean_ground_truth(gt_text)
+            else:
+                gt_text = ""
+            ground_truths.append(gt_text)
+        return ground_truths
+
+    def _clean_ground_truth(self, gt_text: str) -> str:
+        """
+        Clean ground truth by extracting the first complete answer from concatenated answers.
+        """
+        # Strip whitespace
+        gt_text = gt_text.strip()
         
-        if len(valid_positions) == 0:
-            return 0, 0
+        # Find all answer tags
+        answer_pattern = r'<answer>(.*?)</answer>'
+        matches = re.findall(answer_pattern, gt_text, re.DOTALL)
         
-        gen_start = valid_positions[0].item()
-        gen_end = valid_positions[-1].item() + 1
-        
-        return gen_start, gen_end
+        if matches:
+            # Return the first complete answer
+            first_answer = matches[0].strip()
+            return f"<answer>{first_answer}</answer>"
+        else:
+            # If no answer tags found, return as is
+            return gt_text
 
     def evaluation_loop(
         self,
@@ -725,11 +845,11 @@ class GRPOTrainer(Trainer):
             
             # Generate single response per example for evaluation
             with torch.no_grad():
-                generated_texts, _ = self.generate_responses(inputs)
+                generated_texts = self.generate_responses_eval(inputs)
                 
             # Compute rewards and save samples during evaluation
             for i in range(batch_size):
-                gen_text = generated_texts[i * self.args.grpo_sample_size]  # Take first sample
+                gen_text = generated_texts[i]  # Single sample per input in eval
                 gt_text = ground_truths[i]
                 
                 format_reward = self.compute_format_reward(gen_text)
@@ -739,17 +859,16 @@ class GRPOTrainer(Trainer):
                 total_accuracy_reward += accuracy_reward
                 total_samples += 1
                 
-                # Save evaluation samples (save a few for inspection)
-                if step < 5:  # Save first 5 batches during evaluation
-                    prompt = self._extract_prompt_from_input(inputs["input_ids"][i])
-                    self.save_output_sample(
-                        prompt=prompt,
-                        generated_text=gen_text,
-                        ground_truth=gt_text,
-                        format_reward=format_reward,
-                        accuracy_reward=accuracy_reward,
-                        step=f"eval_{self.state.global_step}_{step}_{i}"
-                    )
+                # Save all evaluation samples for complete tracking
+                prompt = self._extract_prompt_from_input(inputs["input_ids"][i])
+                self.save_output_sample(
+                    prompt=prompt,
+                    generated_text=gen_text,
+                    ground_truth=gt_text,
+                    format_reward=format_reward,
+                    accuracy_reward=accuracy_reward,
+                    step=f"eval_{self.state.global_step}_{step}_{i}"
+                )
         
         # Flush any remaining outputs at end of evaluation
         self._flush_outputs_to_file()

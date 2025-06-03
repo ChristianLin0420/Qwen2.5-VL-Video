@@ -178,6 +178,7 @@ def train_grpo(attn_implementation="flash_attention_2"):
         model=model, 
         processing_class=tokenizer, 
         args=training_args,
+        data_args=data_args,
         wandb_run=wandb_run,  # Pass wandb instance
         **data_module
     )
