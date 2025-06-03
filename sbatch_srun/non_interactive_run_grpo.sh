@@ -13,7 +13,7 @@
 #SBATCH --gpus-per-node=8
 #SBATCH --cpus-per-task=32 # number of cores
 
-#SBATCH --job-name=aircraft-nvila-8b-video-image-vt-ft-llm-ft-grpo-8gen-1epcs-no-think-kl-original-example # customize your job name
+#SBATCH --job-name=qwen25-vl-7b-grpo # customize your job name
 #SBATCH --output=./logs/%x-%j/stdout.log      # !!!! Update log NAME Here
 #SBATCH --error=./logs/%x-%j/stderr.log      # !!!! Update log NAME Here
 
@@ -22,16 +22,17 @@
 
 
 # Your training script here, if use conda then don't need container-image/ container-mounts arguments
-IMAGE="nvcr.io/nvidian/iva/nvila-grpo:v1_20250504"
+IMAGE="christianlin0420/qwen25-vl-video:latest"
 
 CMD='
-cd /workspace/VILA;
-([[ "$SLURM_LOCALID" == "0" ]] && echo "installing deps" && pip install --index-url=https://sc-hw-artf.nvidia.com/artifactory/api/pypi/hwinf-mlwfo-pypi/simple --upgrade one-logger-utils) ; ([[ "$SLURM_LOCALID" != "0" ]] && echo "sleeping" && sleep 30) ;
-bash scripts/NVILA/fgvc_aircraft_8b_image_grpo.sh --vt ft --llm ft
+conda activate qwen;
+pip install datasets;
+cd qwen-vl-finetune;
+bash scripts/train_grpo.sh
 '
 # Pass CMD with double quotes
 srun \
     --container-image=$IMAGE \
-    --container-mounts=$HOME:/root,/lustre/fsw/portfolios/edgeai/users/chrislin/projects/multi-modality-research/VILA:/workspace/VILA,/lustre/fsw/portfolios/edgeai/users/chrislin/pretrained_weight:/workspace/pretrained_weight,$HOME/.cache:/root/.cache \
+    --container-mounts=$HOME:/root,/lustre/fsw/portfolios/edgeai/users/chrislin/projects/Qwen2.5-VL-Video:/workspace,$HOME/.cache:/root/.cache \
     --container-writable \
     bash -c "$CMD"

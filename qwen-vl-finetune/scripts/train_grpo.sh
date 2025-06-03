@@ -3,7 +3,7 @@
 # GRPO training script for Qwen-VL with video understanding
 
 # Set environment variables
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export OMP_NUM_THREADS=1
 
 # Model and data paths
@@ -12,8 +12,8 @@ OUTPUT_DIR="./output/qwen2.5-vl-3b-grpo"
 CACHE_DIR="./cache"
 
 # Training parameters
-NUM_TRAIN_EPOCHS=3
-BATCH_SIZE=1  # Adjust based on GPU memory
+NUM_TRAIN_EPOCHS=1
+BATCH_SIZE=2  # Adjust based on GPU memory
 GRADIENT_ACCUMULATION_STEPS=8
 LEARNING_RATE=2e-5
 WARMUP_RATIO=0.03
@@ -24,10 +24,10 @@ GRPO_ALPHA=0.5
 GRPO_BETA=0.1
 FORMAT_REWARD_WEIGHT=0.3
 ACCURACY_REWARD_WEIGHT=0.7
-GENERATION_MAX_LENGTH=50
+GENERATION_MAX_LENGTH=32
 GENERATION_TEMPERATURE=0.7
 GENERATION_TOP_P=0.9
-GRPO_SAMPLE_SIZE=1
+GRPO_SAMPLE_SIZE=4
 
 # Video parameters
 VIDEO_MAX_FRAMES=4
@@ -35,7 +35,7 @@ VIDEO_MIN_FRAMES=4
 BASE_INTERVAL=2
 
 # Run training
-torchrun --nproc_per_node=1 --master_port=29500 \
+torchrun --nproc_per_node=8 --master_port=29500 \
     qwenvl/train/train_grpo.py \
     --model_name_or_path $MODEL_PATH \
     --dataset_use "assy07_grpo" \
@@ -61,7 +61,7 @@ torchrun --nproc_per_node=1 --master_port=29500 \
     --logging_steps 10 \
     --tf32 True \
     --model_max_length $MODEL_MAX_LENGTH \
-    --gradient_checkpointing True \
+    --gradient_checkpointing False \
     --dataloader_num_workers 4 \
     --report_to wandb \
     --run_name "qwen2.5-vl-grpo" \

@@ -11,5 +11,5 @@ srun \
     --mem-per-cpu=4G \
     --time=4:00:00 \
     --container-image=$IMAGE \
-    --container-mounts=$HOME:/root,/lustre/fsw/portfolios/edgeai/users/chrislin/projects/Qwen2.5-VL-Video:/workspace/Qwen2.5-VL-Video,$HOME/.cache:/root/.cache \
+    --container-mounts=$HOME:/root,/lustre/fsw/portfolios/edgeai/users/chrislin/projects/Qwen2.5-VL-Video:/workspace,$HOME/.cache:/root/.cache \
     --pty /bin/bash

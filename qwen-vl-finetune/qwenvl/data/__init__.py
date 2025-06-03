@@ -31,6 +31,11 @@ ASSY07_GRPO = {
     "data_path": "../datasets/",
 }
 
+ASSY07_GRPO_NO_THINK = {
+    "annotation_path": "../datasets/ASSY07-relabel-train-10vids-train-mcq-min_frames_4-max_frames_8_grpo-no-think.json",
+    "data_path": "../datasets/",
+}
+
 data_dict = {
     "cambrian_737k": CAMBRIAN_737K,
     "cambrian_737k_pack": CAMBRIAN_737K_PACK,
@@ -38,6 +43,7 @@ data_dict = {
     "clevr_mc": CLEVR_MC,
     "videochatgpt": VIDEOCHATGPT,
     "assy07_grpo": ASSY07_GRPO,
+    "assy07_grpo_no_think": ASSY07_GRPO_NO_THINK,
 }
 
 
