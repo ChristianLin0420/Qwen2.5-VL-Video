@@ -1,19 +1,3 @@
-# Adopted from https://github.com/lm-sys/FastChat. Below is the original copyright:
-# Adopted from tatsu-lab@stanford_alpaca. Below is the original copyright:
-#    Copyright 2023 Rohan Taori, Ishaan Gulrajani, Tianyi Zhang, Yann Dubois, Xuechen Li
-#
-#    Licensed under the Apache License, Version 2.0 (the "License");
-#    you may not use this file except in compliance with the License.
-#    You may obtain a copy of the License at
-#
-#        http://www.apache.org/licenses/LICENSE-2.0
-#
-#    Unless required by applicable law or agreed to in writing, software
-#    distributed under the License is distributed on an "AS IS" BASIS,
-#    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#    See the License for the specific language governing permissions and
-#    limitations under the License.
-
 import os
 import logging
 import pathlib
@@ -28,8 +12,8 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent.parent
 sys.path.append(str(project_root))
 
-import qwenvl.train.trainer
-from trainer import replace_qwen2_vl_attention_class
+from qwenvl.train.grpo_trainer import GRPOTrainer, GRPOTrainingArguments
+from qwenvl.train.trainer import replace_qwen2_vl_attention_class
 
 from transformers import (
     Qwen2VLForConditionalGeneration,
@@ -40,9 +24,8 @@ from qwenvl.data.data_qwen_packed import make_supervised_data_module_packed
 from qwenvl.train.argument import (
     ModelArguments,
     DataArguments,
-    TrainingArguments,
 )
-from transformers import AutoTokenizer, AutoProcessor, Qwen2VLImageProcessor, Trainer
+from transformers import AutoTokenizer, AutoProcessor, Qwen2VLImageProcessor
 
 local_rank = None
 
@@ -92,17 +75,18 @@ def set_model(model_args, model):
         model.lm_head.requires_grad = False
 
 
-def train(attn_implementation="flash_attention_2"):
+def train_grpo(attn_implementation="flash_attention_2"):
     global local_rank
 
     parser = transformers.HfArgumentParser(
-        (ModelArguments, DataArguments, TrainingArguments)
+        (ModelArguments, DataArguments, GRPOTrainingArguments)
     )
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
     local_rank = training_args.local_rank
     os.makedirs(training_args.output_dir, exist_ok=True)
 
+    # Load model
     if "qwen2.5" in model_args.model_name_or_path.lower():
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model_args.model_name_or_path,
@@ -128,6 +112,7 @@ def train(attn_implementation="flash_attention_2"):
 
     if data_args.data_flatten:
         replace_qwen2_vl_attention_class()
+        
     model.config.use_cache = False
 
     if training_args.gradient_checkpointing:
@@ -153,21 +138,31 @@ def train(attn_implementation="flash_attention_2"):
         model.visual.print_trainable_parameters()
         model.model.print_trainable_parameters()
     
+    # Set default dataset if not specified
+    if not data_args.dataset_use:
+        data_args.dataset_use = "assy07_grpo"
+    
+    # Prepare data module
     if data_args.data_packing:
         data_module = make_supervised_data_module_packed(tokenizer=tokenizer, data_args=data_args)
     else:
         data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
-
-    trainer = Trainer(
-        model=model, processing_class=tokenizer, args=training_args, **data_module
+    
+    # Create GRPO trainer
+    trainer = GRPOTrainer(
+        model=model, 
+        processing_class=tokenizer, 
+        args=training_args, 
+        **data_module
     )
 
+    # Train
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         logging.info("checkpoint found, resume training")
         trainer.train(resume_from_checkpoint=True)
     else:
         trainer.train()
-        
+    
     trainer.save_state()
     data_args.image_processor.save_pretrained(training_args.output_dir)
 
@@ -177,4 +172,4 @@ def train(attn_implementation="flash_attention_2"):
 
 
 if __name__ == "__main__":
-    train(attn_implementation="flash_attention_2")
+    train_grpo(attn_implementation="flash_attention_2") 

@@ -14,3 +14,9 @@ wheels/
 
 # wandb
 qwen-vl-finetune/wandb/
+
+# test files
+test_grpo.py
+
+# cache
+qwen-vl-finetune/cache/
