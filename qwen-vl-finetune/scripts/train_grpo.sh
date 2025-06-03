@@ -8,11 +8,11 @@ export OMP_NUM_THREADS=1
 
 # Model and data paths
 MODEL_PATH="Qwen/Qwen2.5-VL-3B-Instruct"  # Change to your model path
-OUTPUT_DIR="./output/qwen2.5-vl-3b-grpo"
+OUTPUT_DIR="./output/qwen2.5-vl-3b-grpo-no-think"
 CACHE_DIR="./cache"
 
 # Training parameters
-NUM_TRAIN_EPOCHS=1
+NUM_TRAIN_EPOCHS=8
 BATCH_SIZE=2  # Adjust based on GPU memory
 GRADIENT_ACCUMULATION_STEPS=8
 LEARNING_RATE=2e-5
@@ -38,7 +38,7 @@ BASE_INTERVAL=2
 torchrun --nproc_per_node=8 --master_port=29500 \
     qwenvl/train/train_grpo.py \
     --model_name_or_path $MODEL_PATH \
-    --dataset_use "assy07_grpo" \
+    --dataset_use "assy07_grpo_no_think" \
     --data_flatten True \
     --output_dir $OUTPUT_DIR \
     --cache_dir $CACHE_DIR \

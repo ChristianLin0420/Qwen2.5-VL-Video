@@ -368,16 +368,18 @@ class GRPOTrainer(Trainer):
                     labels[i:i+1], 
                     sample_generated_ids
                 )
+
+                modified_input_ids = inputs["input_ids"][i:i+1]
+                modified_labels = labels[i:i+1]
                 
                 # Create standard attention mask for modified sequence
-                # modified_attention_mask = torch.ones_like(modified_input_ids, dtype=torch.bool)
-                attnetion_mask = torch.ones_like(inputs["input_ids"][i:i+1], dtype=torch.bool)
+                modified_attention_mask = torch.ones_like(modified_input_ids, dtype=torch.bool)
                 
                 # Forward pass with standard attention (no cu_seqlens)
                 outputs = model(
-                    input_ids=inputs["input_ids"][i:i+1],
-                    labels=labels[i:i+1],
-                    attention_mask=attnetion_mask,
+                    input_ids=modified_input_ids,
+                    labels=modified_labels,
+                    attention_mask=modified_attention_mask,
                     # Don't use position_ids from flattened format
                     pixel_values=inputs.get("pixel_values")[i:i+1] if "pixel_values" in inputs and inputs["pixel_values"] is not None else None,
                     image_grid_thw=inputs.get("image_grid_thw")[i:i+1] if "image_grid_thw" in inputs and inputs["image_grid_thw"] is not None else None,
@@ -388,8 +390,8 @@ class GRPOTrainer(Trainer):
                 # Reference model with standard attention
                 with torch.no_grad():
                     ref_outputs = self.ref_model(
-                        input_ids=inputs["input_ids"][i:i+1],
-                        attention_mask=attnetion_mask,
+                        input_ids=modified_input_ids,
+                        attention_mask=modified_attention_mask,
                         pixel_values=inputs.get("pixel_values")[i:i+1] if "pixel_values" in inputs and inputs["pixel_values"] is not None else None,
                         image_grid_thw=inputs.get("image_grid_thw")[i:i+1] if "image_grid_thw" in inputs and inputs["image_grid_thw"] is not None else None,
                         pixel_values_videos=inputs.get("pixel_values_videos") if "pixel_values_videos" in inputs and inputs["pixel_values_videos"] is not None else None,
