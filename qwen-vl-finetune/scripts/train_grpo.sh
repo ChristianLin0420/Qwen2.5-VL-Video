@@ -6,19 +6,22 @@
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export OMP_NUM_THREADS=1
 
-# Model and data paths
-MODEL_PATH="Qwen/Qwen2.5-VL-3B-Instruct"  # Change to your model path
-OUTPUT_DIR="./output/qwen2.5-vl-3b-grpo-no-think"
-CACHE_DIR="./cache"
-
 # Dataset selection affects format rewards:
 # - Names with "no_think": Only <answer>...</answer> expected
 # - Names without "no_think": <think>...</think> <answer>...</answer> expected
 DATASET_NAME="assy07_grpo_no_think"
 
+# Wandb run name
+WANDB_RUN_NAME="qwen2.5-vl-7b-grpo-${DATASET_NAME}-per_token_loss"
+
+# Model and data paths
+MODEL_PATH="Qwen/Qwen2.5-VL-7B-Instruct"  # Change to your model path
+OUTPUT_DIR="./output/${WANDB_RUN_NAME}"
+CACHE_DIR="./cache"
+
 # Training parameters
 NUM_TRAIN_EPOCHS=1
-BATCH_SIZE=2
+BATCH_SIZE=1
 GRADIENT_ACCUMULATION_STEPS=8
 LEARNING_RATE=2e-5
 WARMUP_RATIO=0.03
@@ -29,12 +32,11 @@ GRPO_ALPHA=0.5
 GRPO_BETA=0.1
 FORMAT_REWARD_WEIGHT=1.0
 ACCURACY_REWARD_WEIGHT=1.0
-GENERATION_MAX_LENGTH=128
+GENERATION_MAX_LENGTH=64
 GENERATION_TEMPERATURE=0.7
 GENERATION_TOP_P=0.9
-GRPO_SAMPLE_SIZE=4
+GRPO_SAMPLE_SIZE=1
 GRPO_LOGGING_STEPS=1
-WANDB_RUN_NAME="qwen2.5-vl-3b-grpo-no-think"
 
 # Video parameters
 VIDEO_MAX_FRAMES=4
@@ -70,7 +72,7 @@ torchrun --nproc_per_node=8 --master_port=29500 \
     --model_max_length $MODEL_MAX_LENGTH \
     --gradient_checkpointing False \
     --dataloader_num_workers 4 \
-    --report_to wandb \
+    --report_to none \
     --run_name $WANDB_RUN_NAME \
     --bf16 True \
     --tune_mm_llm True \

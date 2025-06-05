@@ -90,12 +90,12 @@ class GRPOTrainer(Trainer):
         
         # Initialize metric tracking for GRPO logging
         self.grpo_metrics = {
-            'policy_seq_log_prob': [],
             'kl_div': [],
             'format_reward': [],
             'accuracy_reward': [],
             'total_reward': [],
-            'advantage': []
+            'advantage': [],
+            'total_loss': []
         }
         self._global_step_count = 0
         
@@ -106,13 +106,15 @@ class GRPOTrainer(Trainer):
         # Initialize JSON output logging
         self.output_log_file = os.path.join(args.output_dir, f"grpo_outputs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
         self.outputs_buffer = []
-        self.max_buffer_size = 200  # Increased buffer size to handle more frequent saves
+        self.max_buffer_size = 10000  # Increased buffer size to handle more frequent saves
         
         # DON'T replace attention here - only during training
         
     def log_grpo_metrics(self, step: Optional[int] = None):
         """Log accumulated GRPO metrics directly to wandb."""
-        if not self.grpo_metrics['policy_seq_log_prob']:  # No metrics collected yet
+
+        if not self.grpo_metrics['kl_div']:  # No metrics collected yet
+            print(f"DEBUG - No metrics collected yet")
             return
             
         # Calculate averages
@@ -128,7 +130,9 @@ class GRPOTrainer(Trainer):
         # Log directly to wandb using passed wandb_run instance
         try:
             if self.wandb_run is not None and torch.distributed.get_rank() == 0:
-                self.wandb_run.log(avg_metrics, step=step)
+                print(f"DEBUG - Logging metrics to wandb with step: {step}: {avg_metrics}")
+                print(f"DEBUG - grpo_metrics: {self.grpo_metrics}")
+                self.wandb_run.log(avg_metrics)
         except Exception as e:
             print(f"Error logging to wandb: {e}")
             print(f"Metrics that would be logged: {avg_metrics}")
@@ -136,10 +140,6 @@ class GRPOTrainer(Trainer):
         # Clear metrics after logging
         for key in self.grpo_metrics:
             self.grpo_metrics[key].clear()
-            
-        # Print metrics for monitoring
-        metric_str = ", ".join([f"{k.split('/')[-1]}: {v:.4f}" for k, v in avg_metrics.items()])
-        print(f"Step {step} - GRPO Metrics: {metric_str}")
     
     def save_output_sample(self, prompt: str, generated_text: str, ground_truth: str, 
                           format_reward: float, accuracy_reward: float, step: int):
@@ -207,15 +207,15 @@ class GRPOTrainer(Trainer):
     
     def training_step(self, model, inputs, num_items_in_batch=None):
         """Override training step to handle GRPO metric logging."""
-        # Increment step counter
-        self._global_step_count += 1
         
         # Call parent training step
         loss = super().training_step(model, inputs, num_items_in_batch)
         
-        # Log GRPO metrics if it's time
-        if self._global_step_count % self.args.grpo_logging_steps == 0:
-            self.log_grpo_metrics(step=self.state.global_step)
+        # Increment step counter and log GRPO metrics if it's time
+        if torch.distributed.get_rank() == 0:
+            self._global_step_count += 1
+            if self._global_step_count > 0 and self._global_step_count % self.args.grpo_logging_steps == 0:
+                self.log_grpo_metrics(step=self._global_step_count // self.args.grpo_logging_steps)
         
         return loss
         
@@ -314,6 +314,8 @@ class GRPOTrainer(Trainer):
         for gen_text, gt_text in zip(generated_texts, ground_truths):
             format_reward = self.compute_format_reward(gen_text)
             accuracy_reward = self.compute_accuracy_reward(gen_text, gt_text)
+
+            print(f"DEBUG - \n gen_text: {gen_text} \n gt_text: {gt_text} \n format_reward: {format_reward} \n accuracy_reward: {accuracy_reward} \n")
             
             # Combine rewards with weights
             total_reward = (
@@ -567,18 +569,29 @@ class GRPOTrainer(Trainer):
         # Compute grouped-wise rewards and advantages
         rewards_grouped = rewards.view(batch_size, self.args.grpo_sample_size)  # (B, G)
         mean_grouped_rewards = rewards_grouped.mean(dim=1)  # (B,)
-        std_grouped_rewards = rewards_grouped.std(dim=1)  # (B,)
-        
-        # Normalize rewards to compute advantages
+        std_grouped_rewards = rewards_grouped.std(dim=1, unbiased=False)  # (B,) - use population std
+
+        # Normalize rewards to compute advantages with better handling
         mean_expanded = mean_grouped_rewards.repeat_interleave(self.args.grpo_sample_size, dim=0)  # (B*G,)
         std_expanded = std_grouped_rewards.repeat_interleave(self.args.grpo_sample_size, dim=0)  # (B*G,)
-        advantages = (rewards - mean_expanded) / (std_expanded + 1e-4)  # (B*G,)
-        
+
+        # Use smaller epsilon and add minimum std threshold
+        min_std = 0.01  # Minimum standard deviation threshold
+        std_expanded = torch.clamp(std_expanded, min=min_std)
+
+        # Alternative: Use global standardization if group-wise std is too small
+        if (std_grouped_rewards < min_std).all():
+            # Fall back to global standardization
+            global_mean = rewards.mean()
+            global_std = rewards.std(unbiased=False)
+            advantages = (rewards - global_mean) / torch.clamp(global_std, min=min_std)
+        else:
+            advantages = (rewards - mean_expanded) / std_expanded
+
         # Compute per-token log probabilities by replacing assistant responses in original sequences
         total_loss = 0.0
         
         # Collect metrics for logging
-        batch_policy_log_probs = []
         batch_kl_divs = []
         batch_advantages = []
         
@@ -621,6 +634,7 @@ class GRPOTrainer(Trainer):
                 completion_end = completion_start + completion_mask[sample_idx].sum().item()
                 
                 if completion_start >= completion_end:
+                    print(f"DEBUG - completion_start: {completion_start}, completion_end: {completion_end}")
                     continue  # Skip if no completion tokens
                 
                 # Extract logits for completion tokens (shift for causal LM)
@@ -641,10 +655,6 @@ class GRPOTrainer(Trainer):
                 # Apply completion mask to valid tokens only
                 valid_mask = completion_mask[sample_idx][:len(policy_token_log_probs)].float()
                 
-                # Compute sequence log probabilities (sum over valid tokens)
-                policy_seq_log_prob = (policy_token_log_probs * valid_mask).sum()
-                ref_seq_log_prob = (ref_token_log_probs * valid_mask).sum()
-                
                 # Compute per-token KL divergence 
                 per_token_kl = torch.exp(ref_token_log_probs - policy_token_log_probs) - \
                               (ref_token_log_probs - policy_token_log_probs) - 1
@@ -652,16 +662,18 @@ class GRPOTrainer(Trainer):
                 # GRPO loss computation (following standard implementation)
                 advantage = advantages[sample_idx]
                 
+                # # CORRECT VERSION - Standard Policy Gradient:
+                # per_token_loss = -policy_token_log_probs * advantage + self.args.grpo_beta * per_token_kl
                 # Per-token loss with advantage weighting
                 per_token_loss = torch.exp(policy_token_log_probs - policy_token_log_probs.detach()) * advantage
                 per_token_loss = -(per_token_loss - self.args.grpo_beta * per_token_kl)
+
                 
                 # Average loss over valid tokens
                 sample_loss = (per_token_loss * valid_mask).sum() / valid_mask.sum()
                 total_loss += sample_loss
                 
                 # Collect metrics
-                batch_policy_log_probs.append(policy_seq_log_prob.item())
                 batch_kl_divs.append((per_token_kl * valid_mask).sum().item() / valid_mask.sum().item())
                 batch_advantages.append(advantage.item())
         
@@ -678,12 +690,12 @@ class GRPOTrainer(Trainer):
             batch_accuracy_rewards.append(accuracy_reward)
         
         # Log GRPO metrics for this batch
-        self.grpo_metrics['policy_seq_log_prob'].extend(batch_policy_log_probs)
         self.grpo_metrics['kl_div'].extend(batch_kl_divs)
         self.grpo_metrics['format_reward'].extend(batch_format_rewards)
         self.grpo_metrics['accuracy_reward'].extend(batch_accuracy_rewards)
         self.grpo_metrics['total_reward'].extend(rewards.cpu().tolist())
         self.grpo_metrics['advantage'].extend(batch_advantages)
+        self.grpo_metrics['total_loss'].append(loss.item())
         
         # Save all sample outputs for complete tracking
         for i in range(batch_size):

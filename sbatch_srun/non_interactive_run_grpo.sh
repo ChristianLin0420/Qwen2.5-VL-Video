@@ -13,7 +13,7 @@
 #SBATCH --gpus-per-node=8
 #SBATCH --cpus-per-task=32 # number of cores
 
-#SBATCH --job-name=qwen25-vl-7b-grpo # customize your job name
+#SBATCH --job-name=qwen_2.5_vl_grpo_assy07 # customize your job name
 #SBATCH --output=./logs/%x-%j/stdout.log      # !!!! Update log NAME Here
 #SBATCH --error=./logs/%x-%j/stderr.log      # !!!! Update log NAME Here
 

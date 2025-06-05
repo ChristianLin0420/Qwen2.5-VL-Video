@@ -23,3 +23,7 @@ qwen-vl-finetune/cache/
 
 # output
 qwen-vl-finetune/output/
+qwen-vl-finetune/output_test/
+
+# logs
+logs/
